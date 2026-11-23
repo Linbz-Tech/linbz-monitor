@@ -1,0 +1,70 @@
+name: Monitor
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+permissions:
+  issues: write
+
+concurrency:
+  group: monitor
+  cancel-in-progress: false
+
+jobs:
+  uptime:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TITULO: Plataforma fora do ar
+    steps:
+      - name: Conferir o portal e a API
+        id: checar
+        run: |
+          falhas=""
+          conferir() {
+            local nome="$1" url="$2" exige_corpo="$3" status=000
+            for tentativa in 1 2 3; do
+              status=$(curl -s -o corpo.txt -w '%{http_code}' --connect-timeout 10 --max-time 20 "$url" || true)
+              if [ "$status" = "200" ] && { [ -z "$exige_corpo" ] || grep -q "$exige_corpo" corpo.txt; }; then
+                return 0
+              fi
+              [ "$tentativa" -lt 3 ] && sleep 10
+            done
+            falhas="${falhas}- ${nome} (${url}): HTTP ${status}"$'\n'
+          }
+          conferir "Portal" "https://app.linbz.com/" ""
+          conferir "API (health)" "https://app.linbz.com/mcp/platform/health" '"status":"UP"'
+          {
+            echo "falhou=$([ -n "$falhas" ] && echo sim || echo nao)"
+            echo "detalhes<<FIM"
+            printf '%s' "$falhas"
+            echo "FIM"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Abrir ou atualizar a issue de queda
+        if: steps.checar.outputs.falhou == 'sim'
+        env:
+          DETALHES: ${{ steps.checar.outputs.detalhes }}
+        run: |
+          agora=$(TZ=America/Sao_Paulo date '+%d/%m/%Y %H:%M')
+          corpo=$(printf 'Falha às %s (horário de Brasília):\n\n%s' "$agora" "$DETALHES")
+          gh label create monitor --color B60205 --description "Alertas do monitor de uptime" 2>/dev/null || true
+          numero=$(gh issue list --label monitor --state open --search "\"$TITULO\" in:title" --json number --jq '.[0].number // empty')
+          if [ -n "$numero" ]; then
+            gh issue comment "$numero" --body "$corpo"
+          else
+            gh issue create --title "$TITULO" --label monitor --body "$corpo"
+          fi
+
+      - name: Fechar a issue quando voltar
+        if: steps.checar.outputs.falhou == 'nao'
+        run: |
+          agora=$(TZ=America/Sao_Paulo date '+%d/%m/%Y %H:%M')
+          for numero in $(gh issue list --label monitor --state open --search "\"$TITULO\" in:title" --json number --jq '.[].number'); do
+            gh issue comment "$numero" --body "Voltou às $agora (horário de Brasília)."
+            gh issue close "$numero"
+          done
